@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart GPS Tracker & Anti-Theft Dashboard</title>
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { display: flex; height: 100vh; background: #0f172a; color: #f8fafc; overflow: hidden; }
+    #sidebar { width: 380px; background: #1e293b; padding: 20px; display: flex; flex-direction: column; gap: 15px; overflow-y: auto; box-shadow: 4px 0 10px rgba(0,0,0,0.3); z-index: 1000; }
+    #map { flex: 1; height: 100%; background: #0f172a; }
+    
+    .card { background: #334155; border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+    .card h3 { font-size: 14px; text-transform: uppercase; color: #94a3b8; letter-spacing: 0.5px; }
+    .status-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }
+    .online { background: #16a34a; color: white; }
+    .offline { background: #dc2626; color: white; }
+    
+    .btn { padding: 10px 14px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    .btn-danger { background: #ef4444; color: white; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-warn { background: #f59e0b; color: white; }
+    .btn-warn:hover { background: #d97706; }
+    .btn-primary { background: #3b82f6; color: white; }
+    .btn-primary:hover { background: #2563eb; }
+
+    select, input { width: 100%; padding: 8px; background: #0f172a; border: 1px solid #475569; border-radius: 6px; color: #f8fafc; }
+    .row { display: flex; gap: 10px; align-items: center; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h2>GPS Motor Tracker</h2>
+    
+    <!-- Status Sambungan -->
+    <div class="card">
+      <div class="row" style="justify-content: space-between;">
+        <span>MQTT Status</span>
+        <span id="mqtt-status" class="status-badge offline">Menghubungkan...</span>
+      </div>
+      <div class="row" style="justify-content: space-between;">
+        <span>Status Geofence</span>
+        <span id="breach-status" class="status-badge online">AMAN</span>
+      </div>
+    </div>
+
+    <!-- Pilihan Kota & Navigasi Cepat -->
+    <div class="card">
+      <h3>Pilihan Kota (Presisi Peta)</h3>
+      <select id="city-select" onchange="changeCity(this.value)">
+        <option value="3.5952,98.6722">Medan</option>
+        <option value="-6.2088,106.8456">Jakarta</option>
+        <option value="-6.9175,107.6191">Bandung</option>
+        <option value="-7.2575,112.7521">Surabaya</option>
+        <option value="-7.7956,110.3695">Yogyakarta</option>
+      </select>
+      <button class="btn btn-primary" onclick="centerVehicle()">Lacak / Fokus ke Motor</button>
+    </div>
+
+    <!-- Telemetri Real-time -->
+    <div class="card">
+      <h3>Telemetri Motor</h3>
+      <p>Kecepatan: <strong id="val-speed">0</strong> km/h</p>
+      <p>Satelit: <strong id="val-sats">0</strong> Fix</p>
+      <p>Koordinat: <span id="val-coord">-</span></p>
+    </div>
+
+    <!-- Kontrol Manual Relay -->
+    <div class="card">
+      <h3>Aksi Saklar Manual</h3>
+      <button id="btn-engine" class="btn btn-danger" onclick="toggleRelay(1)">Matikan Mesin (Relay 1)</button>
+      <button id="btn-horn" class="btn btn-warn" onclick="toggleRelay(2)">Klakson Beep-Beep (Relay 2)</button>
+    </div>
+
+    <!-- Setting Geofence Border & Action Threshold -->
+    <div class="card">
+      <h3>Pengaturan Batas (Geofence)</h3>
+      <p style="font-size: 12px; color: #94a3b8;">Gunakan toolbar Geoman di kiri peta untuk menggambar <b>Circle</b> atau <b>Rectangle</b> batas keamanan.</p>
+      <label style="font-size: 13px;">Respon Jika Keluar Batas:</label>
+      <select id="geo-action">
+        <option value="1">1. Matikan Mesin Saja</option>
+        <option value="2">2. Klakson Saja (Intermiten)</option>
+        <option value="3" selected>3. Matikan Mesin + Klakson</option>
+      </select>
+      <div class="row">
+        <button class="btn btn-primary" style="flex:1;" onclick="applyGeofenceToDevice()">Kirim Batas ke Alat</button>
+        <button class="btn btn-danger" onclick="disableGeofence()">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    const MQTT_HOST = "broker.hivemq.com";
+    const isHttps = (location.protocol === 'https:');
+    const MQTT_PORT = isHttps ? 8884 : 8000;
+
+    const TOPIC_TELEMETRY = "tracker/motor/rivaldi/telemetry";
+    const TOPIC_CMD       = "tracker/motor/rivaldi/cmd";
+    const TOPIC_GEOFENCE  = "tracker/motor/rivaldi/geofence";
+
+    // Koordinat awal (Medan)
+    let vehicleLat = 3.5952;
+    let vehicleLng = 98.6722;
+    let engineState = 0, hornState = 0;
+    let currentGeoShape = null;
+    let hasGpsFix = false;
+    let autoFollow = false;
+
+    // Inisialisasi Peta
+    const map = L.map('map', {
+      zoomControl: true
+    }).setView([vehicleLat, vehicleLng], 14);
+
+    // Pastikan perhitungan viewport Leaflet akurat terhadap lebar sisa layar
+    setTimeout(() => { map.invalidateSize(); }, 300);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap France | &copy; OpenStreetMap'
+    }).addTo(map);
+
+    // Marker Icon Motor
+    const motoIcon = L.icon({
+      iconUrl: 'https://cdn-icons-png.flaticon.com/512/3063/3063822.png',
+      iconSize: [38, 38],
+      iconAnchor: [19, 19],
+      popupAnchor: [0, -19]
+    });
+
+    const vehicleMarker = L.marker([vehicleLat, vehicleLng], { icon: motoIcon }).addTo(map);
+    vehicleMarker.bindPopup("<b>Unit Motor</b><br>Posisi awal");
+
+    // Toolbar Geoman
+    map.pm.addControls({
+      position: 'topleft',
+      drawCircle: true,
+      drawRectangle: true,
+      drawPolygon: false,
+      drawMarker: false,
+      drawPolyline: false,
+      drawCircleMarker: false,
+      editMode: true,
+      dragMode: true,
+      cutPolygon: false,
+      removalMode: true
+    });
+
+    map.on('pm:create', (e) => {
+      if (currentGeoShape) {
+        map.removeLayer(currentGeoShape);
+      }
+      currentGeoShape = e.layer;
+    });
+
+    // Paho MQTT Client
+    const client = new Paho.MQTT.Client(MQTT_HOST, MQTT_PORT, "web-dash-" + Math.floor(Math.random() * 100000));
+
+    client.onConnectionLost = (response) => {
+      document.getElementById('mqtt-status').className = 'status-badge offline';
+      document.getElementById('mqtt-status').innerText = 'Terputus';
+      setTimeout(connectMQTT, 3000);
+    };
+
+    client.onMessageArrived = (message) => {
+      if (message.destinationName === TOPIC_TELEMETRY) {
+        try {
+          const data = JSON.parse(message.payloadString);
+          
+          const rawLat = parseFloat(data.lat);
+          const rawLng = parseFloat(data.lng);
+
+          // Validasi bahwa koordinat bukan 0.0 dan berada dalam rentang wajar bola bumi
+          if (!isNaN(rawLat) && !isNaN(rawLng) && rawLat !== 0 && rawLng !== 0 && Math.abs(rawLat) <= 90 && Math.abs(rawLng) <= 180) {
+            vehicleLat = rawLat;
+            vehicleLng = rawLng;
+            hasGpsFix = true;
+
+            const targetLatLng = L.latLng(vehicleLat, vehicleLng);
+            vehicleMarker.setLatLng(targetLatLng);
+
+            // Jika mode tracking auto-follow aktif, bawa fokus ke target
+            if (autoFollow) {
+              map.panTo(targetLatLng, { animate: true, duration: 0.5 });
+            }
+          }
+
+          document.getElementById('val-speed').innerText = (data.speed !== undefined && !isNaN(data.speed)) ? Number(data.speed).toFixed(1) : "0.0";
+          document.getElementById('val-sats').innerText = data.sats !== undefined ? data.sats : 0;
+          document.getElementById('val-coord').innerText = hasGpsFix 
+            ? `${vehicleLat.toFixed(5)}, ${vehicleLng.toFixed(5)}` 
+            : "Mencari Satelit...";
+
+          engineState = data.r1;
+          hornState = data.r2;
+          document.getElementById('btn-engine').innerText = engineState ? "Hidupkan Mesin" : "Matikan Mesin (Relay 1)";
+          document.getElementById('btn-horn').innerText = hornState ? "Hentikan Klakson" : "Klakson Beep-Beep (Relay 2)";
+
+          const breachBadge = document.getElementById('breach-status');
+          if (data.breach === 1) {
+            breachBadge.className = 'status-badge offline';
+            breachBadge.innerText = 'DILUAR BATAS!';
+          } else {
+            breachBadge.className = 'status-badge online';
+            breachBadge.innerText = 'AMAN';
+          }
+        } catch (err) {
+          console.error("Gagal parsing payload telemetri:", err);
+        }
+      }
+    };
+
+    function connectMQTT() {
+      client.connect({
+        useSSL: isHttps,
+        timeout: 5,
+        onSuccess: () => {
+          document.getElementById('mqtt-status').className = 'status-badge online';
+          document.getElementById('mqtt-status').innerText = 'Terhubung';
+          client.subscribe(TOPIC_TELEMETRY);
+        },
+        onFailure: (err) => {
+          document.getElementById('mqtt-status').className = 'status-badge offline';
+          document.getElementById('mqtt-status').innerText = 'Gagal Konek';
+          setTimeout(connectMQTT, 3000);
+        }
+      });
+    }
+    connectMQTT();
+
+    function changeCity(coordStr) {
+      autoFollow = false;
+      const parts = coordStr.split(',');
+      const cLat = parseFloat(parts[0]);
+      const cLng = parseFloat(parts[1]);
+      map.setView([cLat, cLng], 13);
+    }
+
+    // FUNGSI FOKUS KE MOTOR YANG TELAH DIPERBAIKI SECARA PRESISI
+    function centerVehicle() {
+      map.invalidateSize(); // Reset kalkulasi bounding box peta
+
+      // Ambil posisi presisi langsung dari marker motor yang sudah terpasang di peta
+      const currentMarkerPos = vehicleMarker.getLatLng();
+
+      if (!hasGpsFix && currentMarkerPos.lat === 3.5952 && currentMarkerPos.lng === 98.6722) {
+        alert("GPS belum lock sinyal satelit. Menampilkan koordinat perkiraan awal.");
+      }
+
+      autoFollow = true; // Kunci kamera agar terus membuntuti motor
+      
+      // Pusatkan pandangan tepat pada koordinat marker
+      map.flyTo([currentMarkerPos.lat, currentMarkerPos.lng], 17, {
+        animate: true,
+        duration: 1.0
+      });
+
+      vehicleMarker.openPopup();
+    }
+
+    // Jika user sengaja menggeser peta dengan mouse/sentuhan, lepas auto-follow
+    map.on('dragstart', () => {
+      autoFollow = false;
+    });
+
+    function toggleRelay(ch) {
+      let targetState = (ch === 1) ? (engineState ? 0 : 1) : (hornState ? 0 : 1);
+      const payload = JSON.stringify({ relay: ch, state: targetState });
+      const msg = new Paho.MQTT.Message(payload);
+      msg.destinationName = TOPIC_CMD;
+      client.send(msg);
+    }
+
+    function applyGeofenceToDevice() {
+      if (!currentGeoShape) {
+        alert("Silakan buat border di peta terlebih dahulu menggunakan Circle atau Square tools di sebelah kiri!");
+        return;
+      }
+
+      const action = parseInt(document.getElementById('geo-action').value);
+      let payload = { enabled: 1, action: action };
+
+      if (currentGeoShape instanceof L.Circle) {
+        const center = currentGeoShape.getLatLng();
+        payload.type = "circle";
+        payload.lat = center.lat;
+        payload.lng = center.lng;
+        payload.radius = currentGeoShape.getRadius();
+      } else if (currentGeoShape instanceof L.Rectangle || currentGeoShape instanceof L.Polygon) {
+        const bounds = currentGeoShape.getBounds();
+        payload.type = "square";
+        payload.min_lat = bounds.getSouth();
+        payload.max_lat = bounds.getNorth();
+        payload.min_lng = bounds.getWest();
+        payload.max_lng = bounds.getEast();
+      }
+
+      const msg = new Paho.MQTT.Message(JSON.stringify(payload));
+      msg.destinationName = TOPIC_GEOFENCE;
+      client.send(msg);
+      alert("Konfigurasi border geofence berhasil dikirim & disimpan ke Flash ESP32!");
+    }
+
+    function disableGeofence() {
+      if (currentGeoShape) {
+        map.removeLayer(currentGeoShape);
+        currentGeoShape = null;
+      }
+      const payload = JSON.stringify({ enabled: 0 });
+      const msg = new Paho.MQTT.Message(payload);
+      msg.destinationName = TOPIC_GEOFENCE;
+      client.send(msg);
+      alert("Border geofence dinonaktifkan.");
+    }
+  </script>
+</body>
+</html>
